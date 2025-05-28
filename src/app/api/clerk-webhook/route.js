@@ -1,87 +1,90 @@
-import { headers } from "next/headers";
-import { NextResponse } from "next/server";
 import { Webhook } from "svix";
-import { clerkClient } from "@clerk/backend";
+import { headers } from "next/headers";
+import { WebhookEvent } from "@clerk/nextjs/server";
 import { createClient } from "@supabase/supabase-js";
 
-// === ENV ===
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const CLERK_WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
+const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-// === SUPABASE CLIENT ===
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-// === HANDLER ===
 export async function POST(req) {
-    const payload = await req.text();
-    const headerList = headers();
+    const WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
 
-    const svixHeaders = {
-        "svix-id": headerList.get("svix-id"),
-        "svix-timestamp": headerList.get("svix-timestamp"),
-        "svix-signature": headerList.get("svix-signature"),
-    };
-
-    const webhook = new Webhook(CLERK_WEBHOOK_SECRET);
-
-    let evt;
-    try {
-        evt = webhook.verify(payload, svixHeaders);
-    } catch (err) {
-        console.error("[Webhook] Assinatura inválida:", err);
-        return NextResponse.json(
-            { error: "Invalid signature" },
-            { status: 400 }
+    if (!WEBHOOK_SECRET) {
+        throw new Error(
+            "Please add CLERK_WEBHOOK_SECRET from Clerk Dashboard to .env"
         );
     }
 
-    const eventType = evt.type;
-    const user = evt.data;
+    const headerPayload = headers();
+    const svix_id = headerPayload.get("svix-id");
+    const svix_timestamp = headerPayload.get("svix-timestamp");
+    const svix_signature = headerPayload.get("svix-signature");
 
-    if (eventType === "user.created") {
-        const fullName = `${user.first_name || ""} ${
-            user.last_name || ""
-        }`.trim();
-        const email = user.email_addresses?.[0]?.email_address || "";
-        const userId = user.id;
-
-        const { data: existingUser, error: selectError } = await supabase
-            .from("users")
-            .select("id")
-            .eq("user_id", userId)
-            .single();
-
-        if (selectError && selectError.code !== "PGRST116") {
-            console.error("[Supabase] Erro ao buscar usuário:", selectError);
-            return NextResponse.json(
-                { error: "Erro ao buscar usuário" },
-                { status: 500 }
-            );
-        }
-
-        if (!existingUser) {
-            const { error: insertError } = await supabase.from("users").insert({
-                user_id: userId,
-                full_name: fullName,
-                email: email,
-                credits: 10,
-            });
-
-            if (insertError) {
-                console.error(
-                    "[Supabase] Erro ao inserir usuário:",
-                    insertError
-                );
-                return NextResponse.json(
-                    { error: "Erro ao criar usuário" },
-                    { status: 500 }
-                );
-            }
-        }
-
-        return NextResponse.json({ success: true });
+    if (!svix_id || !svix_timestamp || !svix_signature) {
+        return new Response("Error occurred -- no svix headers", {
+            status: 400,
+        });
     }
 
-    return NextResponse.json({ message: `Evento ignorado: ${eventType}` });
+    const payload = await req.json();
+    const body = JSON.stringify(payload);
+
+    const wh = new Webhook(WEBHOOK_SECRET);
+
+    let evt;
+
+    try {
+        evt = wh.verify(body, {
+            "svix-id": svix_id,
+            "svix-timestamp": svix_timestamp,
+            "svix-signature": svix_signature,
+        });
+    } catch (err) {
+        console.error("Error verifying webhook:", err);
+        return new Response("Error verifying webhook", {
+            status: 400,
+        });
+    }
+
+    const eventType = evt.type;
+
+    try {
+        if (eventType === "user.created" || eventType === "user.updated") {
+            const { id, email_addresses, first_name, last_name } = evt.data;
+            const email = email_addresses[0].email_address;
+            const fullName = `${first_name} ${last_name}`;
+
+            // Upsert user data into Supabase
+            const { error } = await supabase.from("users").upsert(
+                {
+                    user_id: id,
+                    email,
+                    full_name: fullName,
+                    updated_at: new Date().toISOString(),
+                },
+                {
+                    onConflict: "user_id",
+                }
+            );
+
+            if (error) throw error;
+        } else if (eventType === "user.deleted") {
+            const { id } = evt.data;
+
+            // Delete user from Supabase
+            const { error } = await supabase
+                .from("users")
+                .delete()
+                .eq("user_id", id);
+
+            if (error) throw error;
+        }
+
+        return new Response("", { status: 200 });
+    } catch (error) {
+        console.error("Error handling webhook:", error);
+        return new Response("Error handling webhook", { status: 500 });
+    }
 }
